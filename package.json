@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "SA DWS Real-time Streamflow Dashboard",
   "main": "server/index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build": "cd client && npm install && npm run build",
     "start": "node server/index.js"
