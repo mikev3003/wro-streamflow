@@ -1089,6 +1089,16 @@ const SCRAPED_COORDS = {
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Allow embedding in iframes on the Water Research Observatory
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'ALLOW-FROM https://waterresearchobservatory.org');
+  res.setHeader(
+    'Content-Security-Policy',
+    "frame-ancestors 'self' https://waterresearchobservatory.org https://www.waterresearchobservatory.org"
+  );
+  next();
+});
 app.use(express.static(path.join(__dirname, '../client/dist')));
 
 const DWS_BASE = 'https://www.dws.gov.za';
