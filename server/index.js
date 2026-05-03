@@ -2,7 +2,46 @@ const express = require('express');
 const { parse } = require('node-html-parser');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
+const puppeteer = require('puppeteer');
 const { STATION_COORDS, WMA_BOUNDS, WMA_CENTERS } = require('./stationCoords');
+
+// Auto-detect Chrome executable path
+function findChrome() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/opt/render/project/src/.puppeteer-cache';
+  const searchDirs = [
+    cacheDir,
+    '/opt/render/project/src/.puppeteer-cache',
+    path.join(require('os').homedir(), '.cache', 'puppeteer'),
+  ];
+  for (const dir of searchDirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const find = (d, depth = 0) => {
+        if (depth > 6) return null;
+        for (const f of fs.readdirSync(d)) {
+          const full = path.join(d, f);
+          const stat = fs.statSync(full);
+          if (stat.isFile() && f === 'chrome') return full;
+          if (stat.isDirectory()) {
+            const inner = path.join(full, 'chrome');
+            if (fs.existsSync(inner) && fs.statSync(inner).isFile()) return inner;
+            const found = find(full, depth + 1);
+            if (found) return found;
+          }
+        }
+        return null;
+      };
+      const found = find(dir);
+      if (found) { console.log('[chrome] Found at: ' + found); return found; }
+    } catch (_) {}
+  }
+  console.log('[chrome] No executable found, using puppeteer default');
+  return undefined;
+}
 
 // Coords scraped from DWS PDF catalogues (auto-populated at runtime + pre-seeded from PDFs)
 // Format: [lat, lng] in decimal degrees
@@ -1228,76 +1267,67 @@ function extractField(html, fieldId) {
 async function fetchAllStations() {
   const allStations = [];
   const seen = new Set();
-  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
-  console.log('[fetch] Loading DWS page...');
+  console.log('[puppeteer] Launching browser...');
+  let browser;
   try {
-    // GET initial page — follow redirects to get final URL
-    const initRes = await fetch(DWS_URL, {
-      headers: { 'User-Agent': UA },
-      signal: AbortSignal.timeout(30000),
-      redirect: 'follow',
+    const executablePath = findChrome();
+    browser = await puppeteer.launch({
+      headless: true,
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
 
-    // Use the final URL after redirects for POSTs
-    const finalUrl = initRes.url || DWS_URL;
-    console.log(`[fetch] Final URL: ${finalUrl}`);
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
 
-    // Grab session cookie from response
-    const setCookie = initRes.headers.get('set-cookie') || '';
-    const cookie = setCookie.split(';')[0];
-    console.log(`[fetch] Cookie: ${cookie ? cookie.substring(0, 30) : 'none'}`);
+    console.log('[puppeteer] Loading DWS page...');
+    await page.goto(DWS_URL, { waitUntil: 'networkidle2', timeout: 45000 });
 
-    const initHtml = await initRes.text();
-
-    // Parse default page (WMA4)
-    const initStations = parseStations(initHtml);
-    console.log(`[fetch] WMA4 (default): ${initStations.length} stations`);
-    for (const s of initStations) {
-      if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
-    }
-
-    // POST for each other WMA using final URL + session cookie
     for (const wma of WMA_TABS) {
-      if (wma.btn === 'Wma4') continue;
       try {
-        console.log(`[fetch] Fetching ${wma.id}...`);
-
-        const params = new URLSearchParams({ 'wmaBttn': wma.btn });
-
-        const res = await fetch(finalUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type':  'application/x-www-form-urlencoded',
-            'User-Agent':    UA,
-            'Referer':       finalUrl,
-            ...(cookie ? { 'Cookie': cookie } : {}),
-          },
-          body: params.toString(),
-          signal: AbortSignal.timeout(30000),
-          redirect: 'follow',
-        });
-
-        const html = await res.text();
-        console.log(`[fetch] ${wma.id} response: ${res.status}, length: ${html.length}`);
-
+        if (wma.btn !== 'Wma4') {
+          console.log('[puppeteer] Clicking ' + wma.id + ' tab...');
+          await page.evaluate((btn) => {
+            const buttons = Array.from(document.querySelectorAll('button[name="wmaBttn"]'));
+            const match = buttons.find(b => b.value === btn);
+            if (match) match.click();
+          }, wma.btn);
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+          await new Promise(r => setTimeout(r, 1500));
+        }
+        const html = await page.content();
         const parsed = parseStations(html);
-        console.log(`[fetch] ${wma.id}: ${parsed.length} stations`);
+        console.log('[puppeteer] ' + wma.id + ': ' + parsed.length + ' stations');
         for (const s of parsed) {
           if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
         }
-        await new Promise(r => setTimeout(r, 800));
       } catch (err) {
-        console.error(`[fetch] ${wma.id} failed:`, err.message);
+        console.error('[puppeteer] ' + wma.id + ' failed:', err.message);
       }
     }
   } catch (err) {
-    console.error('[fetch] Failed:', err.message);
+    console.error('[puppeteer] Failed:', err.message);
+    // Plain fetch fallback for WMA4 only
+    try {
+      const res = await fetch(DWS_URL, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(20000),
+      });
+      const html = await res.text();
+      for (const s of parseStations(html)) {
+        if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
+      }
+    } catch (e) { console.error('[fetch] Fallback failed:', e.message); }
+  } finally {
+    if (browser) await browser.close();
+    console.log('[puppeteer] Browser closed.');
   }
 
-  console.log(`[fetch] Total stations: ${allStations.length}`);
+  console.log('[puppeteer] Total stations: ' + allStations.length);
   return allStations;
 }
+
 
 // ── Background coord scraper ───────────────────────────────────────────────
 // After main data fetch, quietly scrape coords for stations that are missing them
