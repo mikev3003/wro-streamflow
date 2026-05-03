@@ -1270,12 +1270,7 @@ async function fetchAllStations() {
         console.log(`[fetch] Fetching ${wma.id}...`);
 
         const params = new URLSearchParams({
-          '__EVENTTARGET':        '',
-          '__EVENTARGUMENT':      '',
-          '__VIEWSTATE':          currentVS,
-          '__VIEWSTATEGENERATOR': currentVSG,
-          '__EVENTVALIDATION':    currentEV,
-          'wmaBtn':               wma.btn,
+          'wmaBttn': wma.btn,
         });
 
         const res = await fetch(DWS_URL, {
