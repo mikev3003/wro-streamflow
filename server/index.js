@@ -1219,68 +1219,94 @@ function parseStations(html) {
   return stations;
 }
 
-// ── Plain fetch scraper (all WMAs via POST) ────────────────────────────────
-async function fetchWMA(wma, viewState) {
-  const params = new URLSearchParams({
-    '__EVENTTARGET': '',
-    '__EVENTARGUMENT': '',
-    '__VIEWSTATE': viewState,
-    'wmaBtn': wma.btn,
-  });
-
-  const res = await fetch(DWS_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Referer': DWS_URL,
-    },
-    body: params.toString(),
-    signal: AbortSignal.timeout(30000),
-  });
-
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
-}
-
-function extractViewState(html) {
-  const match = html.match(/id="__VIEWSTATE"\s+value="([^"]+)"/);
+// ── Plain fetch scraper (all WMAs via POST with session) ──────────────────
+function extractField(html, fieldId) {
+  const match = html.match(new RegExp(`id="${fieldId}"\\s+value="([^"]*)"`, 'i'));
   return match ? match[1] : '';
 }
 
 async function fetchAllStations() {
   const allStations = [];
   const seen = new Set();
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
   console.log('[fetch] Loading DWS page...');
   try {
-    // First GET to grab the initial page (WMA4 default) + ViewState
+    // GET initial page — captures session cookie + hidden fields
     const initRes = await fetch(DWS_URL, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      headers: { 'User-Agent': UA },
       signal: AbortSignal.timeout(30000),
+      redirect: 'follow',
     });
-    const initHtml = await initRes.text();
-    const viewState = extractViewState(initHtml);
 
-    // Parse the default WMA4 page
+    // Grab session cookie from response
+    const setCookie = initRes.headers.get('set-cookie') || '';
+    const cookie = setCookie.split(';')[0];
+
+    const initHtml = await initRes.text();
+
+    // Extract all ASP.NET hidden fields
+    const viewState          = extractField(initHtml, '__VIEWSTATE');
+    const viewStateGen       = extractField(initHtml, '__VIEWSTATEGENERATOR');
+    const eventValidation    = extractField(initHtml, '__EVENTVALIDATION');
+
+    console.log(`[fetch] ViewState length: ${viewState.length}, Cookie: ${cookie ? 'yes' : 'no'}`);
+
+    // Parse default page (WMA4)
     const initStations = parseStations(initHtml);
     console.log(`[fetch] WMA4 (default): ${initStations.length} stations`);
     for (const s of initStations) {
       if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
     }
 
-    // POST for each other WMA
+    // POST for each other WMA carrying the session cookie
+    let currentVS = viewState;
+    let currentVSG = viewStateGen;
+    let currentEV = eventValidation;
+
     for (const wma of WMA_TABS) {
-      if (wma.btn === 'Wma4') continue; // already got this one
+      if (wma.btn === 'Wma4') continue;
       try {
         console.log(`[fetch] Fetching ${wma.id}...`);
-        const html = await fetchWMA(wma, viewState);
+
+        const params = new URLSearchParams({
+          '__EVENTTARGET':        '',
+          '__EVENTARGUMENT':      '',
+          '__VIEWSTATE':          currentVS,
+          '__VIEWSTATEGENERATOR': currentVSG,
+          '__EVENTVALIDATION':    currentEV,
+          'wmaBtn':               wma.btn,
+        });
+
+        const res = await fetch(DWS_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type':  'application/x-www-form-urlencoded',
+            'User-Agent':    UA,
+            'Referer':       DWS_URL,
+            ...(cookie ? { 'Cookie': cookie } : {}),
+          },
+          body: params.toString(),
+          signal: AbortSignal.timeout(30000),
+          redirect: 'follow',
+        });
+
+        const html = await res.text();
+
+        // Update hidden fields from response for next POST
+        const newVS  = extractField(html, '__VIEWSTATE');
+        const newVSG = extractField(html, '__VIEWSTATEGENERATOR');
+        const newEV  = extractField(html, '__EVENTVALIDATION');
+        if (newVS)  currentVS  = newVS;
+        if (newVSG) currentVSG = newVSG;
+        if (newEV)  currentEV  = newEV;
+
         const parsed = parseStations(html);
         console.log(`[fetch] ${wma.id}: ${parsed.length} stations`);
         for (const s of parsed) {
           if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
         }
-        await new Promise(r => setTimeout(r, 500)); // be polite to DWS
+        await new Promise(r => setTimeout(r, 800));
       } catch (err) {
         console.error(`[fetch] ${wma.id} failed:`, err.message);
       }
