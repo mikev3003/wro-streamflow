@@ -1421,6 +1421,21 @@ setInterval(async () => {
 }, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────────────────────
+app.get('/api/debug-wma2', async (req, res) => {
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+  const initRes = await fetch(DWS_URL, { headers: { 'User-Agent': UA }, redirect: 'follow' });
+  const finalUrl = initRes.url || DWS_URL;
+  const setCookie = initRes.headers.get('set-cookie') || '';
+  const cookie = setCookie.split(';')[0];
+  const params = new URLSearchParams({ 'wmaBttn': 'Wma2' });
+  const r = await fetch(finalUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA, 'Referer': finalUrl, ...(cookie ? { 'Cookie': cookie } : {}) },
+    body: params.toString(), redirect: 'follow',
+  });
+  const html = await r.text();
+  res.send(html);
+});
 app.get('/api/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
