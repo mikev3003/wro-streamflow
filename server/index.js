@@ -2,7 +2,6 @@ const express = require('express');
 const { parse } = require('node-html-parser');
 const cors = require('cors');
 const path = require('path');
-const puppeteer = require('puppeteer');
 const { STATION_COORDS, WMA_BOUNDS, WMA_CENTERS } = require('./stationCoords');
 
 // Coords scraped from DWS PDF catalogues (auto-populated at runtime + pre-seeded from PDFs)
@@ -1220,107 +1219,77 @@ function parseStations(html) {
   return stations;
 }
 
-// ── Puppeteer scraper ──────────────────────────────────────────────────────
+// ── Plain fetch scraper (all WMAs via POST) ────────────────────────────────
+async function fetchWMA(wma, viewState) {
+  const params = new URLSearchParams({
+    '__EVENTTARGET': '',
+    '__EVENTARGUMENT': '',
+    '__VIEWSTATE': viewState,
+    'wmaBtn': wma.btn,
+  });
+
+  const res = await fetch(DWS_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': DWS_URL,
+    },
+    body: params.toString(),
+    signal: AbortSignal.timeout(30000),
+  });
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
+function extractViewState(html) {
+  const match = html.match(/id="__VIEWSTATE"\s+value="([^"]+)"/);
+  return match ? match[1] : '';
+}
+
 async function fetchAllStations() {
   const allStations = [];
   const seen = new Set();
 
-  console.log('[puppeteer] Launching browser...');
-  let browser;
+  console.log('[fetch] Loading DWS page...');
   try {
-    // Find Chrome on Windows
-    const chromePaths = [
-      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-      process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
-    ];
+    // First GET to grab the initial page (WMA4 default) + ViewState
+    const initRes = await fetch(DWS_URL, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      signal: AbortSignal.timeout(30000),
+    });
+    const initHtml = await initRes.text();
+    const viewState = extractViewState(initHtml);
 
-    let executablePath;
-    const fs = require('fs');
-    for (const p of chromePaths) {
-      try { if (fs.existsSync(p)) { executablePath = p; break; } } catch (_) {}
+    // Parse the default WMA4 page
+    const initStations = parseStations(initHtml);
+    console.log(`[fetch] WMA4 (default): ${initStations.length} stations`);
+    for (const s of initStations) {
+      if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
     }
 
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36');
-
-    // Navigate to the page
-    console.log('[puppeteer] Loading DWS page...');
-    await page.goto(DWS_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-
-    // Scrape each WMA tab
+    // POST for each other WMA
     for (const wma of WMA_TABS) {
+      if (wma.btn === 'Wma4') continue; // already got this one
       try {
-        if (wma.btn !== 'Wma4') {
-          // Click the WMA tab button
-          console.log(`[puppeteer] Clicking ${wma.id} tab...`);
-          await page.evaluate((btn) => {
-            // Find button by value or text
-            const buttons = Array.from(document.querySelectorAll('input[type=submit], button'));
-            const match = buttons.find(b => 
-              b.value === btn || b.textContent.includes(btn) ||
-              b.name === 'wmaBtn' && b.value === btn
-            );
-            if (match) match.click();
-            else {
-              // Try form submission directly
-              const form = document.querySelector('form');
-              if (form) {
-                const input = document.createElement('input');
-                input.type = 'hidden';
-                input.name = 'wmaBtn';
-                input.value = btn;
-                form.appendChild(input);
-                form.submit();
-              }
-            }
-          }, wma.btn);
-
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
-          await new Promise(r => setTimeout(r, 1000));
-        }
-
-        const html = await page.content();
+        console.log(`[fetch] Fetching ${wma.id}...`);
+        const html = await fetchWMA(wma, viewState);
         const parsed = parseStations(html);
-        console.log(`[puppeteer] ${wma.id}: ${parsed.length} stations`);
+        console.log(`[fetch] ${wma.id}: ${parsed.length} stations`);
         for (const s of parsed) {
           if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
         }
+        await new Promise(r => setTimeout(r, 500)); // be polite to DWS
       } catch (err) {
-        console.error(`[puppeteer] ${wma.id} failed:`, err.message);
+        console.error(`[fetch] ${wma.id} failed:`, err.message);
       }
     }
-
-    // Background: scrape coords for stations missing them
-    await scrapeCoords(allStations, page);
   } catch (err) {
-    console.error('[puppeteer] Failed:', err.message);
-    // Fallback to plain fetch if puppeteer fails
-    console.log('[fetch] Falling back to plain fetch...');
-    try {
-      const res = await fetch(DWS_URL, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        signal: AbortSignal.timeout(20000),
-      });
-      const html = await res.text();
-      const parsed = parseStations(html);
-      for (const s of parsed) {
-        if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
-      }
-    } catch (e) {
-      console.error('[fetch] Fallback also failed:', e.message);
-    }
-  } finally {
-    if (browser) await browser.close();
-    console.log('[puppeteer] Browser closed.');
+    console.error('[fetch] Failed:', err.message);
   }
 
+  console.log(`[fetch] Total stations: ${allStations.length}`);
   return allStations;
 }
 
