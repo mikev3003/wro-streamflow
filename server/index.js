@@ -1232,25 +1232,23 @@ async function fetchAllStations() {
 
   console.log('[fetch] Loading DWS page...');
   try {
-    // GET initial page — captures session cookie + hidden fields
+    // GET initial page — follow redirects to get final URL
     const initRes = await fetch(DWS_URL, {
       headers: { 'User-Agent': UA },
       signal: AbortSignal.timeout(30000),
       redirect: 'follow',
     });
 
+    // Use the final URL after redirects for POSTs
+    const finalUrl = initRes.url || DWS_URL;
+    console.log(`[fetch] Final URL: ${finalUrl}`);
+
     // Grab session cookie from response
     const setCookie = initRes.headers.get('set-cookie') || '';
     const cookie = setCookie.split(';')[0];
+    console.log(`[fetch] Cookie: ${cookie ? cookie.substring(0, 30) : 'none'}`);
 
     const initHtml = await initRes.text();
-
-    // Extract all ASP.NET hidden fields
-    const viewState          = extractField(initHtml, '__VIEWSTATE');
-    const viewStateGen       = extractField(initHtml, '__VIEWSTATEGENERATOR');
-    const eventValidation    = extractField(initHtml, '__EVENTVALIDATION');
-
-    console.log(`[fetch] ViewState length: ${viewState.length}, Cookie: ${cookie ? 'yes' : 'no'}`);
 
     // Parse default page (WMA4)
     const initStations = parseStations(initHtml);
@@ -1259,26 +1257,20 @@ async function fetchAllStations() {
       if (!seen.has(s.code)) { seen.add(s.code); allStations.push(s); }
     }
 
-    // POST for each other WMA carrying the session cookie
-    let currentVS = viewState;
-    let currentVSG = viewStateGen;
-    let currentEV = eventValidation;
-
+    // POST for each other WMA using final URL + session cookie
     for (const wma of WMA_TABS) {
       if (wma.btn === 'Wma4') continue;
       try {
         console.log(`[fetch] Fetching ${wma.id}...`);
 
-        const params = new URLSearchParams({
-          'wmaBttn': wma.btn,
-        });
+        const params = new URLSearchParams({ 'wmaBttn': wma.btn });
 
-        const res = await fetch(DWS_URL, {
+        const res = await fetch(finalUrl, {
           method: 'POST',
           headers: {
             'Content-Type':  'application/x-www-form-urlencoded',
             'User-Agent':    UA,
-            'Referer':       DWS_URL,
+            'Referer':       finalUrl,
             ...(cookie ? { 'Cookie': cookie } : {}),
           },
           body: params.toString(),
@@ -1287,14 +1279,7 @@ async function fetchAllStations() {
         });
 
         const html = await res.text();
-
-        // Update hidden fields from response for next POST
-        const newVS  = extractField(html, '__VIEWSTATE');
-        const newVSG = extractField(html, '__VIEWSTATEGENERATOR');
-        const newEV  = extractField(html, '__EVENTVALIDATION');
-        if (newVS)  currentVS  = newVS;
-        if (newVSG) currentVSG = newVSG;
-        if (newEV)  currentEV  = newEV;
+        console.log(`[fetch] ${wma.id} response: ${res.status}, length: ${html.length}`);
 
         const parsed = parseStations(html);
         console.log(`[fetch] ${wma.id}: ${parsed.length} stations`);
